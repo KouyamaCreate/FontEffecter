@@ -1,7 +1,7 @@
 effects:
 - name: round_corners
   params:
-    angle_threshold: 100
+    angle_threshold: 140
     radius: 40
 input_font: /Users/koseiyamamoto/Library/CloudStorage/Dropbox/Downloads/Inter,Manrope,Noto_Sans,Noto_Sans_JP
   (1)/Noto_Sans_JP/static/NotoSansJP-Medium.ttf

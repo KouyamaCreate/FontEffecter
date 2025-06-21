@@ -63,6 +63,8 @@ class RoundCornersEffect(BaseEffect):
                 # 座標データから輪郭を抽出
                 contours = self._extract_contours_from_coordinates(original_coords, original_endPts, original_flags)
                 # print(f"  輪郭数: {len(contours)}個")
+                # パス自動連結前処理
+                contours = self._auto_join_contours(contours)
                 
                 # 角丸処理を各輪郭に適用
                 new_coords = []
@@ -149,12 +151,69 @@ class RoundCornersEffect(BaseEffect):
         
         return contours
 
-    def _round_corners_direct(self, contour, radius, angle_threshold=160):
+    def _auto_join_contours(self, contours, tol=1e-3):
+        """
+        端点が一致する複数のcontourを自動連結する。
+        tol: float, 端点一致判定の許容誤差（単位: フォント座標系）
+        """
+        import numpy as np
+
+        def points_close(p1, p2):
+            return np.linalg.norm(np.array(p1) - np.array(p2)) < tol
+
+        used = [False] * len(contours)
+        joined_contours = []
+
+        for i, c in enumerate(contours):
+            if used[i]:
+                continue
+            coords = list(c['coords'])
+            flags = list(c['flags'])
+            changed = True
+            used[i] = True
+            while changed:
+                changed = False
+                for j, c2 in enumerate(contours):
+                    if used[j] or i == j:
+                        continue
+                    # 終点-始点
+                    if points_close(coords[-1], c2['coords'][0]):
+                        coords.extend(c2['coords'][1:])
+                        flags.extend(c2['flags'][1:])
+                        used[j] = True
+                        changed = True
+                        break
+                    # 始点-終点
+                    elif points_close(coords[0], c2['coords'][-1]):
+                        coords = c2['coords'][:-1] + coords
+                        flags = c2['flags'][:-1] + flags
+                        used[j] = True
+                        changed = True
+                        break
+                    # 始点-始点（反転して連結）
+                    elif points_close(coords[0], c2['coords'][0]):
+                        coords = list(reversed(c2['coords']))[:-1] + coords
+                        flags = list(reversed(c2['flags']))[:-1] + flags
+                        used[j] = True
+                        changed = True
+                        break
+                    # 終点-終点（反転して連結）
+                    elif points_close(coords[-1], c2['coords'][-1]):
+                        coords.extend(list(reversed(c2['coords']))[1:])
+                        flags.extend(list(reversed(c2['flags']))[1:])
+                        used[j] = True
+                        changed = True
+                        break
+            joined_contours.append({'coords': coords, 'flags': flags})
+        return joined_contours
+
+    def _round_corners_direct(self, contour, config_radius, angle_threshold=160):
         """
         座標データを直接操作して角丸処理を行う。
         安全なデータ操作により、元の輪郭データを保持しながら新しい輪郭を構築する。
 
         直線判定は、3点(p0, p1, p2)についてp1と線分p0-p2の距離が0.001以下であれば直線とみなす。
+        角ごとに辺長に応じて最大半径を計算し、config.yaml指定のradiusと比較して小さい方を使用する。
         """
         import math
 
@@ -162,7 +221,7 @@ class RoundCornersEffect(BaseEffect):
         flags = contour['flags']
         n = len(coords)
 
-        if radius == 0 or n < 3:
+        if config_radius == 0 or n < 3:
             return contour
 
         new_coords = []
@@ -198,6 +257,16 @@ class RoundCornersEffect(BaseEffect):
                 new_coords.append(p1)
                 new_flags.append(flags[i])
                 continue
+
+            # 動的角丸半径計算: 角ごとに最大半径を辺長から決定
+            # P0-P1, P1-P2それぞれの距離
+            dist1 = math.hypot(x1 - x0, y1 - y0)
+            dist2 = math.hypot(x2 - x1, y2 - y1)
+            max_radius = min(dist1, dist2) / 2.0
+            actual_radius = min(config_radius, max_radius)
+
+            # 以降はactual_radiusを使って角丸処理（既存のradius使用部分をactual_radiusに差し替え）
+            # --- この下の角丸生成ロジックで actual_radius を利用してください ---
 
             # 距離が閾値を超えた場合、角度判定も追加
             v1 = (x0 - x1, y0 - y1)
@@ -240,8 +309,8 @@ class RoundCornersEffect(BaseEffect):
             
             if norm1 > 0 and norm2 > 0:
                 # 角丸処理: 元の点を3点（T1, P1, T2）に置き換え
-                l1 = min(radius, norm1 * 0.5)
-                l2 = min(radius, norm2 * 0.5)
+                l1 = min(actual_radius, norm1 * 0.5)
+                l2 = min(actual_radius, norm2 * 0.5)
                 
                 T1 = lerp(p1, p0, l1 / norm1)
                 T2 = lerp(p1, p2, l2 / norm2)
@@ -316,8 +385,8 @@ class RoundCornersEffect(BaseEffect):
             
             # 第二段階: 角度閾値による判定（直線でない点に対してのみ実行）
             if angle_degrees < angle_threshold:
-                l1 = min(radius, norm1 * 0.5)
-                l2 = min(radius, norm2 * 0.5)
+                l1 = min(actual_radius, norm1 * 0.5)
+                l2 = min(actual_radius, norm2 * 0.5)
                 
                 T1 = lerp(p2, p1, l1 / norm1)
                 T2 = lerp(p2, p3, l2 / norm2)
