@@ -200,7 +200,19 @@ class RoundCornersEffect(BaseEffect):
             angle = math.acos(max(-1, min(1, dot / (norm1 * norm2))))
             angle_degrees = math.degrees(angle)
             
-            # 角度が閾値未満の場合に角丸処理が必要
+            # 第一段階: 直線判定（180度に非常に近い場合、または極小角度の場合は直線とみなして除外）
+            straight_line_tolerance = 2.0  # 178度～182度の範囲を直線とみなす
+            very_small_angle_threshold = 3.0  # 3度未満の極小角度も直線の一部とみなす
+            
+            # 180度に近い角度（ほぼ直線）
+            if abs(angle_degrees - 180.0) <= straight_line_tolerance:
+                continue
+            
+            # 極小角度の場合も直線の延長とみなす（ユーザー報告の問題に対応）
+            if angle_degrees <= very_small_angle_threshold:
+                continue
+            
+            # 第二段階: 角度閾値による判定（直線でない点に対してのみ実行）
             if angle_degrees < angle_threshold:
                 l1 = min(radius, norm1 * 0.5)
                 l2 = min(radius, norm2 * 0.5)
