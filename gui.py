@@ -40,15 +40,17 @@ class FontConfigGUI:
         self.angle_threshold_entry = tk.Entry(self.root, textvariable=self.angle_threshold_var, width=10)
         self.angle_threshold_entry.grid(row=3, column=1, sticky="w")
 
+        # 直線判定の許容誤差
+
         # variationセクション（動的）
         self.variation_frame = tk.LabelFrame(self.root, text="Variable Font: variation設定（軸名と値）")
-        self.variation_frame.grid(row=4, column=0, columnspan=3, sticky="ew", padx=5, pady=5)
+        self.variation_frame.grid(row=5, column=0, columnspan=3, sticky="ew", padx=5, pady=5)
         self.variation_vars = {}  # 軸名→StringVar
 
         # ボタン
-        tk.Button(self.root, text="設定を保存", command=self.save_config).grid(row=5, column=0, pady=15)
-        tk.Button(self.root, text="処理実行", command=self.run_processing).grid(row=5, column=1, pady=15)
-        tk.Button(self.root, text="終了", command=self.root.quit).grid(row=5, column=2, pady=15)
+        tk.Button(self.root, text="設定を保存", command=self.save_config).grid(row=6, column=0, pady=15)
+        tk.Button(self.root, text="処理実行", command=self.run_processing).grid(row=6, column=1, pady=15)
+        tk.Button(self.root, text="終了", command=self.root.quit).grid(row=6, column=2, pady=15)
 
     def setup_variation_fields(self, font_path=None, variation_dict=None):
         # 現在のフィールドをクリア

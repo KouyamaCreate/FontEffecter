@@ -79,7 +79,10 @@ class RoundCornersEffect(BaseEffect):
                         new_flags.extend(contour['flags'])
                     else:
                         # print(f"      角丸処理を実行中...")
-                        rounded_contour = self._round_corners_direct(contour, radius, self.params.get('angle_threshold', 160))
+                        angle_threshold = self.params.get('angle_threshold', 160)
+                        rounded_contour = self._round_corners_direct(
+                            contour, radius, angle_threshold
+                        )
                         # print(f"      角丸処理後の点数: {len(rounded_contour['coords'])}個")
                         new_coords.extend(rounded_contour['coords'])
                         new_flags.extend(rounded_contour['flags'])
@@ -125,6 +128,7 @@ class RoundCornersEffect(BaseEffect):
         
         return font
 
+
     def _extract_contours_from_coordinates(self, coordinates, endPts, flags):
         """
         座標データから直接輪郭を抽出する。
@@ -149,15 +153,112 @@ class RoundCornersEffect(BaseEffect):
         """
         座標データを直接操作して角丸処理を行う。
         安全なデータ操作により、元の輪郭データを保持しながら新しい輪郭を構築する。
+
+        直線判定は、3点(p0, p1, p2)についてp1と線分p0-p2の距離が0.001以下であれば直線とみなす。
         """
         import math
-        
+
         coords = contour['coords']
         flags = contour['flags']
         n = len(coords)
-        
+
         if radius == 0 or n < 3:
             return contour
+
+        new_coords = []
+        new_flags = []
+        
+        for i in range(n):
+            p0 = coords[i - 1]
+            p1 = coords[i]
+            p2 = coords[(i + 1) % n]
+
+            # p1と線分p0-p2の距離を計算
+            x0, y0 = p0
+            x1, y1 = p1
+            x2, y2 = p2
+
+            # 線分p0-p2が1点に潰れている場合は距離を直接
+            dx = x2 - x0
+            dy = y2 - y0
+            if dx == 0 and dy == 0:
+                dist = math.hypot(x1 - x0, y1 - y0)
+            else:
+                # 線分p0-p2上の最近点を求める
+                t = ((x1 - x0) * dx + (y1 - y0) * dy) / (dx * dx + dy * dy)
+                t = max(0.0, min(1.0, t))
+                proj_x = x0 + t * dx
+                proj_y = y0 + t * dy
+                dist = math.hypot(x1 - proj_x, y1 - proj_y)
+
+            # ハイブリッド直線判定: 距離または角度で直線扱い
+            ANGLE_THRESHOLD = 178.0  # ここで閾値を調整
+            # 距離が非常に小さい場合は直線扱い
+            if dist <= 0.001:
+                new_coords.append(p1)
+                new_flags.append(flags[i])
+                continue
+
+            # 距離が閾値を超えた場合、角度判定も追加
+            v1 = (x0 - x1, y0 - y1)
+            v2 = (x2 - x1, y2 - y1)
+            norm1 = math.hypot(*v1)
+            norm2 = math.hypot(*v2)
+            if norm1 == 0 or norm2 == 0:
+                new_coords.append(p1)
+                new_flags.append(flags[i])
+                continue
+            dot = v1[0] * v2[0] + v1[1] * v2[1]
+            # 内積から角度（度数法）を算出
+            cos_theta = max(-1.0, min(1.0, dot / (norm1 * norm2)))
+            angle_deg = math.degrees(math.acos(cos_theta))
+            # 角度が閾値以上なら直線扱い
+            if angle_deg >= ANGLE_THRESHOLD:
+                new_coords.append(p1)
+                new_flags.append(flags[i])
+                continue
+            cos_angle = dot / (norm1 * norm2)
+            cos_angle = min(1.0, max(-1.0, cos_angle))
+            angle = math.degrees(math.acos(cos_angle))
+            if angle > angle_threshold:
+                new_coords.append(p1)
+                new_flags.append(flags[i])
+                continue
+
+            # 角丸処理を実行
+            def distance(p1, p2):
+                return math.hypot(p2[0] - p1[0], p2[1] - p1[1])
+
+            def lerp(p1, p2, t):
+                return (p1[0] + (p2[0] - p1[0]) * t, p1[1] + (p2[1] - p1[1]) * t)
+            
+            # ベクトル計算
+            v1 = (x0 - x1, y0 - y1)
+            v2 = (x2 - x1, y2 - y1)
+            norm1 = math.hypot(*v1)
+            norm2 = math.hypot(*v2)
+            
+            if norm1 > 0 and norm2 > 0:
+                # 角丸処理: 元の点を3点（T1, P1, T2）に置き換え
+                l1 = min(radius, norm1 * 0.5)
+                l2 = min(radius, norm2 * 0.5)
+                
+                T1 = lerp(p1, p0, l1 / norm1)
+                T2 = lerp(p1, p2, l2 / norm2)
+                
+                # 3点を追加: T1 (オンカーブ), P1 (制御点), T2 (オンカーブ)
+                new_coords.append(T1)
+                new_flags.append(1)  # オンカーブ
+                new_coords.append(p1)
+                new_flags.append(0)  # オフカーブ（制御点）
+                new_coords.append(T2)
+                new_flags.append(1)  # オンカーブ
+            else:
+                # ベクトルが0の場合は元の点をそのまま
+                new_coords.append(p1)
+                new_flags.append(flags[i])
+        
+        return {"coords": new_coords, "flags": new_flags}
         
         def distance(p1, p2):
             return math.hypot(p2[0] - p1[0], p2[1] - p1[1])
@@ -201,7 +302,8 @@ class RoundCornersEffect(BaseEffect):
             angle_degrees = math.degrees(angle)
             
             # 第一段階: 直線判定（180度に非常に近い場合、または極小角度の場合は直線とみなして除外）
-            straight_line_tolerance = 2.0  # 178度～182度の範囲を直線とみなす
+            # 点数や全体サイズから自動的に直線判定閾値を推定
+            straight_line_tolerance = self._estimate_straightness_threshold(coords)
             very_small_angle_threshold = 3.0  # 3度未満の極小角度も直線の一部とみなす
             
             # 180度に近い角度（ほぼ直線）
