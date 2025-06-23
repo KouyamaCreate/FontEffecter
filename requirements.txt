@@ -1,3 +1,4 @@
-fontTools
+fonttools
+pyclipper
 PyYAML
 numpy

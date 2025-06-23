@@ -8,6 +8,34 @@ round_corners_effect.py
 from .base_effect import BaseEffect
 
 class RoundCornersEffect(BaseEffect):
+    _warned_once = False
+    
+    def __init__(self, params=None):
+        super().__init__(params)
+        # 属性を確実に初期化
+        self._boolean_ops_available = False
+        
+        # 動的インポートを __init__ で実行
+        import importlib
+        try:
+            from fontTools.pens.recordingPen import RecordingPen
+            from fontTools.pens.basePen import decomposeQuadraticSegment
+            from fontTools.pens.ttGlyphPen import TTGlyphPen
+            from fontTools.booleanOperations import BooleanGlyph, union
+            self.BooleanGlyph = BooleanGlyph
+            self.union = union
+            self._boolean_ops_available = True
+        except ImportError:
+            try:
+                boolean_ops_module = importlib.import_module("fontTools.booleanOperations")
+                self.BooleanGlyph = boolean_ops_module.BooleanGlyph
+                self.union = boolean_ops_module.union
+                self._boolean_ops_available = True
+                print("INFO: Successfully loaded booleanOperations via dynamic import.")
+            except ImportError:
+                self._boolean_ops_available = False
+                print("WARNING: Path union feature failed to load. Glyphs with overlapping paths may not look correct.")
+    
     def apply(self, font, radius=10, **kwargs):
         """
         フォントの各グリフに角丸処理を適用する。
@@ -17,63 +45,128 @@ class RoundCornersEffect(BaseEffect):
         import math
 
         print("角丸処理を開始します...")
-        
+
         # 設定ファイルからradius取得
         radius = self.params.get('radius', radius)
-        # print(f"使用する角丸半径: {radius}")
-        
+
         # 早期リターン: radiusが0の場合は処理を完全にスキップ
         if radius == 0:
-            # print("半径が0のため、角丸処理を完全にスキップします。")
             return font
-        
+
         glyf_table = font['glyf']
         glyph_names = glyf_table.keys()
-        # print(f"処理対象グリフ数: {len(glyph_names)}個")
 
         processed_count = 0
-        
+
         for glyph_name in glyph_names:
-            # print(f"グリフ '{glyph_name}' を処理中...")
             glyph = glyf_table[glyph_name]
-            
+
             # コンポジットグリフはスキップ
             if glyph.isComposite():
-                # print(f"  コンポジットグリフのためスキップ")
                 continue
             if not hasattr(glyph, "coordinates") or glyph.numberOfContours == 0:
-                # print(f"  座標データなし、または輪郭なしのためスキップ")
                 continue
 
             try:
                 # グリフデータを直接操作する安全なアプローチ
-                # print(f"  グリフデータを直接操作して角丸処理を実行")
-                
+
                 # 元の座標データを取得
                 if not hasattr(glyph, 'coordinates') or not glyph.coordinates:
-                    # print(f"  座標データがないためスキップ")
                     continue
-                
+
                 original_coords = list(glyph.coordinates)
                 original_endPts = list(glyph.endPtsOfContours)
                 original_flags = list(glyph.flags)
-                
-                # print(f"  元のデータ - 座標数: {len(original_coords)}, 輪郭終点数: {len(original_endPts)}")
-                
+
                 # 座標データから輪郭を抽出
                 contours = self._extract_contours_from_coordinates(original_coords, original_endPts, original_flags)
-                # print(f"  輪郭数: {len(contours)}個")
                 # パス自動連結前処理
                 contours = self._auto_join_contours(contours)
-                
+
+                # パス統合（Union）処理の可否判定
+                use_union = self._boolean_ops_available
+
+                if use_union:
+                    from fontTools.pens.recordingPen import RecordingPen
+                    from fontTools.pens.basePen import decomposeQuadraticSegment
+                    from fontTools.pens.ttGlyphPen import TTGlyphPen
+                    from fontTools.booleanOperations import BooleanGlyph, union
+
+                    def contours_to_BooleanGlyph(contours):
+                        bg = BooleanGlyph()
+                        for contour in contours:
+                            coords = contour['coords']
+                            flags = contour['flags']
+                            if not coords or len(coords) < 2:
+                                continue
+                            pen = bg.getPen()
+                            pen.moveTo(coords[0])
+                            i = 1
+                            while i < len(coords):
+                                is_on_curve = flags[i] & 1
+                                if is_on_curve:
+                                    pen.lineTo(coords[i])
+                                else:
+                                    if i + 1 < len(coords) and (flags[i + 1] & 1):
+                                        pen.qCurveTo(coords[i], coords[i + 1])
+                                        i += 1
+                                    else:
+                                        mid = (
+                                            (coords[i - 1][0] + coords[i][0]) / 2,
+                                            (coords[i - 1][1] + coords[i][1]) / 2
+                                        )
+                                        pen.qCurveTo(coords[i], mid)
+                                i += 1
+                            pen.closePath()
+                        return bg
+
+                    def BooleanGlyph_to_contours(bg):
+                        pen = RecordingPen()
+                        bg.draw(pen)
+                        contours = []
+                        current_coords = []
+                        current_flags = []
+                        for cmd, pts in pen.value:
+                            if cmd == "moveTo":
+                                if current_coords:
+                                    contours.append({'coords': current_coords, 'flags': current_flags})
+                                current_coords = [pts[0]]
+                                current_flags = [1]
+                            elif cmd == "lineTo":
+                                current_coords.append(pts[0])
+                                current_flags.append(1)
+                            elif cmd == "qCurveTo":
+                                for p in pts[:-1]:
+                                    current_coords.append(p)
+                                    current_flags.append(0)  # off-curve
+                                current_coords.append(pts[-1])
+                                current_flags.append(1)  # end on-curve
+                            elif cmd == "closePath":
+                                pass
+                            elif cmd == "endPath":
+                                pass
+                        if current_coords:
+                            contours.append({'coords': current_coords, 'flags': current_flags})
+                        return contours
+
+                    bg = contours_to_BooleanGlyph(contours)
+                    union_bg = BooleanGlyph()
+                    union(bg, union_bg)
+                    unified_contours = BooleanGlyph_to_contours(union_bg)
+                else:
+                    if not RoundCornersEffect._warned_once:
+                        print("WARNING: Path union feature failed to load. Glyphs with overlapping paths may not look correct. Continuing with basic corner rounding.")
+                        RoundCornersEffect._warned_once = True
+                    unified_contours = contours
+
                 # 角丸処理を各輪郭に適用
                 new_coords = []
                 new_endPts = []
                 new_flags = []
-                
-                for contour_idx, contour in enumerate(contours):
+
+                for contour_idx, contour in enumerate(unified_contours):
                     # print(f"    輪郭{contour_idx + 1}: 点数 {len(contour['coords'])}個")
-                    
+
                     if len(contour['coords']) < 3:
                         # print(f"      点が少なすぎるため角丸処理をスキップ")
                         # そのまま追加
@@ -88,29 +181,33 @@ class RoundCornersEffect(BaseEffect):
                         # print(f"      角丸処理後の点数: {len(rounded_contour['coords'])}個")
                         new_coords.extend(rounded_contour['coords'])
                         new_flags.extend(rounded_contour['flags'])
-                    
+
                     # 輪郭終点を記録
                     new_endPts.append(len(new_coords) - 1)
-                
+
                 # print(f"  処理後のデータ - 座標数: {len(new_coords)}, 輪郭終点数: {len(new_endPts)}")
                 
+                # データ整合性チェック
+                if len(new_coords) != len(new_flags):
+                    print(f"  [ERROR] 座標数とフラグ数が一致しません: coords={len(new_coords)}, flags={len(new_flags)}")
+
                 # 元と同じ形式でデータを作成
                 from fontTools.ttLib.tables._g_l_y_f import GlyphCoordinates
-                
+
                 # GlyphCoordinatesオブジェクトを作成
                 coord_obj = GlyphCoordinates(new_coords)
-                
+
                 # フラグをbytearrayに変換
                 flag_array = bytearray(new_flags)
-                
+
                 # 輪郭終点はlistのまま
                 endPts_list = new_endPts
-                
+
                 # グリフデータを更新
                 glyph.coordinates = coord_obj
                 glyph.endPtsOfContours = endPts_list
                 glyph.flags = flag_array
-                
+
                 # バウンディングボックスを再計算
                 if new_coords:
                     x_coords = [coord[0] for coord in new_coords]
@@ -429,3 +526,119 @@ class RoundCornersEffect(BaseEffect):
             'coords': new_coords,
             'flags': new_flags
         }
+
+    def _contours_to_skia_path(self, contours):
+        """
+        fontToolsの輪郭データをskia.Pathオブジェクトに変換する。
+        """
+        from pathops import Path
+        
+        path = Path()
+        
+        for contour in contours:
+            coords = contour['coords']
+            flags = contour['flags']
+            
+            if not coords:
+                continue
+                
+            # 最初の点に移動
+            path.moveTo(*coords[0])
+            
+            i = 1
+            while i < len(coords):
+                if flags[i] & 1:  # オンカーブ点
+                    path.lineTo(*coords[i])
+                    i += 1
+                else:  # オフカーブ点（制御点）
+                    if i + 1 < len(coords) and flags[i + 1] & 1:
+                        # 二次ベジェ曲線: 制御点 + 終点
+                        path.quadTo(*coords[i], *coords[i + 1])
+                        i += 2
+                    elif i + 2 < len(coords) and flags[i + 1] == 0 and flags[i + 2] & 1:
+                        # 三次ベジェ曲線: 制御点1 + 制御点2 + 終点
+                        path.cubicTo(*coords[i], *coords[i + 1], *coords[i + 2])
+                        i += 3
+                    else:
+                        # 単独の制御点の場合は直線として処理
+                        if i + 1 < len(coords):
+                            path.lineTo(*coords[i + 1])
+                            i += 2
+                        else:
+                            i += 1
+            
+            # 輪郭を閉じる（pathopsでは close() メソッドを使用）
+            path.close()
+        
+        return path
+
+    def _skia_path_to_contours(self, skia_path):
+        """
+        skia.PathオブジェクトをfontToolsの輪郭データに変換する。
+        """
+        contours = []
+        
+        # pathopsのPathからセグメント情報を取得
+        # 簡単な実装として、pathの描画コマンドを解析
+        try:
+            # skia-pathopsのPathオブジェクトから座標を抽出
+            # 実際の実装では、pathの内部構造にアクセスする必要がある
+            # ここでは基本的な変換のみ実装
+            
+            # pathの境界ボックスから基本的な矩形パスを生成（暫定実装）
+            bounds = skia_path.getBounds()
+            if bounds:
+                x_min, y_min, x_max, y_max = bounds
+                
+                # 矩形の4つの角の座標
+                coords = [
+                    (x_min, y_min),
+                    (x_max, y_min),
+                    (x_max, y_max),
+                    (x_min, y_max)
+                ]
+                flags = [1, 1, 1, 1]  # すべてオンカーブ点
+                
+                contours.append({
+                    'coords': coords,
+                    'flags': flags
+                })
+        except Exception as e:
+            print(f"警告: skia.Pathの変換中にエラーが発生しました: {e}")
+            # エラーの場合は空の輪郭を返す
+            contours = []
+        
+        return contours
+
+    def _estimate_straightness_threshold(self, coords):
+        """
+        座標データから直線判定の閾値を推定する。
+        点数や全体サイズに基づいて適切な閾値を計算する。
+        """
+        import math
+        
+        if not coords or len(coords) < 2:
+            return 1.0  # デフォルト値
+        
+        # 座標の範囲を計算
+        x_coords = [coord[0] for coord in coords]
+        y_coords = [coord[1] for coord in coords]
+        
+        x_range = max(x_coords) - min(x_coords)
+        y_range = max(y_coords) - min(y_coords)
+        
+        # 全体のサイズ
+        total_size = math.hypot(x_range, y_range)
+        
+        # 点数に基づく調整
+        num_points = len(coords)
+        
+        # 基本閾値: サイズが大きいほど、点数が多いほど厳しく
+        base_threshold = 0.5
+        size_factor = min(2.0, total_size / 1000.0)  # サイズに応じた調整
+        point_factor = min(2.0, num_points / 50.0)   # 点数に応じた調整
+        
+        threshold = base_threshold + size_factor + point_factor
+        
+        # 最小値と最大値を制限
+        return max(0.1, min(5.0, threshold))
