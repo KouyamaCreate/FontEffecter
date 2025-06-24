@@ -43,16 +43,62 @@ class RoundCornersEffect(BaseEffect):
         radiusはself.params['radius']で取得することを前提とする。
         """
         import math
+        import yaml
 
         print("角丸処理を開始します...")
 
         # 設定ファイルからradius取得
         radius = self.params.get('radius', radius)
 
+        # 品質レベル取得（params優先、なければconfig.yamlから）
+        quality_level = self.params.get('quality_level')
+        if not quality_level:
+            try:
+                with open('config.yaml', encoding='utf-8') as f:
+                    config_data = yaml.safe_load(f)
+                    quality_level = config_data.get('quality_level', 'medium')
+            except Exception:
+                quality_level = 'medium'
+        quality_level = str(quality_level).lower()
+
+        # 品質レベルごとの閾値
+        if quality_level == 'high':
+            ANGLE_THRESHOLD = 175.0
+            angle_threshold = 160
+            min_reduction_ratio = 0.7  # 30%以上減少で警告
+        elif quality_level == 'low':
+            ANGLE_THRESHOLD = 160.0
+            angle_threshold = 110
+            min_reduction_ratio = 0.5  # 50%以上減少で警告
+        else:
+            ANGLE_THRESHOLD = 170.0
+            angle_threshold = 140
+            min_reduction_ratio = 0.5  # 50%以上減少で警告
+
         # 早期リターン: radiusが0の場合は処理を完全にスキップ
         if radius == 0:
             return font
 
+        # フォント形式の判定と対応
+        has_glyf = 'glyf' in font
+        has_cff = 'CFF ' in font
+        
+        print(f"フォント形式: {'TrueType' if has_glyf else 'OpenType/CFF' if has_cff else '不明'}")
+        
+        if not has_glyf and not has_cff:
+            raise ValueError("サポートされていないフォント形式です。TrueType (.ttf) または OpenType/CFF (.otf) フォントを使用してください。")
+        
+        if has_cff:
+            # OpenType/CFFフォントの処理
+            return self._apply_to_cff_font(font, radius, ANGLE_THRESHOLD, angle_threshold, min_reduction_ratio, quality_level)
+        else:
+            # TrueTypeフォントの処理
+            return self._apply_to_truetype_font(font, radius, ANGLE_THRESHOLD, angle_threshold, min_reduction_ratio, quality_level)
+
+    def _apply_to_truetype_font(self, font, radius, ANGLE_THRESHOLD, angle_threshold, min_reduction_ratio, quality_level):
+        """TrueTypeフォント用の角丸処理"""
+        import math
+        
         glyf_table = font['glyf']
         glyph_names = glyf_table.keys()
 
@@ -77,6 +123,7 @@ class RoundCornersEffect(BaseEffect):
                 original_coords = list(glyph.coordinates)
                 original_endPts = list(glyph.endPtsOfContours)
                 original_flags = list(glyph.flags)
+                original_point_count = len(original_coords)
 
                 # 座標データから輪郭を抽出
                 contours = self._extract_contours_from_coordinates(original_coords, original_endPts, original_flags)
@@ -165,28 +212,28 @@ class RoundCornersEffect(BaseEffect):
                 new_flags = []
 
                 for contour_idx, contour in enumerate(unified_contours):
-                    # print(f"    輪郭{contour_idx + 1}: 点数 {len(contour['coords'])}個")
-
                     if len(contour['coords']) < 3:
-                        # print(f"      点が少なすぎるため角丸処理をスキップ")
-                        # そのまま追加
                         new_coords.extend(contour['coords'])
                         new_flags.extend(contour['flags'])
                     else:
-                        # print(f"      角丸処理を実行中...")
-                        angle_threshold = self.params.get('angle_threshold', 160)
+                        # 品質レベルごとに角度閾値を適用
                         rounded_contour = self._round_corners_direct(
-                            contour, radius, angle_threshold
+                            contour, radius, angle_threshold if quality_level != 'high' else ANGLE_THRESHOLD
                         )
-                        # print(f"      角丸処理後の点数: {len(rounded_contour['coords'])}個")
                         new_coords.extend(rounded_contour['coords'])
                         new_flags.extend(rounded_contour['flags'])
 
                     # 輪郭終点を記録
                     new_endPts.append(len(new_coords) - 1)
 
-                # print(f"  処理後のデータ - 座標数: {len(new_coords)}, 輪郭終点数: {len(new_endPts)}")
-                
+                # 頂点数比較（品質維持チェック）
+                new_point_count = len(new_coords)
+                if original_point_count > 0:
+                    reduction_ratio = new_point_count / original_point_count
+                    if reduction_ratio < min_reduction_ratio:
+                        print(f"[品質警告] グリフ '{glyph_name}': 頂点数が{int((1-reduction_ratio)*100)}%減少（{original_point_count}→{new_point_count}）。品質低下の可能性あり、処理をスキップします。")
+                        continue
+
                 # データ整合性チェック
                 if len(new_coords) != len(new_flags):
                     print(f"  [ERROR] 座標数とフラグ数が一致しません: coords={len(new_coords)}, flags={len(new_flags)}")
@@ -223,9 +270,493 @@ class RoundCornersEffect(BaseEffect):
             except Exception as e:
                 print(f"  エラー: グリフ '{glyph_name}' の処理中に例外が発生: {str(e)}")
 
-        print(f"角丸処理が完了しました。処理されたグリフ数: {processed_count}個")
+        print(f"TrueTypeフォントの角丸処理が完了しました。処理されたグリフ数: {processed_count}個")
         
         return font
+
+    def _apply_to_cff_font(self, font, radius, ANGLE_THRESHOLD, angle_threshold, min_reduction_ratio, quality_level):
+        """OpenType/CFFフォント用の角丸処理 - T2CharString座標変化対応版"""
+        import math
+        from fontTools.pens.recordingPen import RecordingPen
+        from fontTools.pens.t2CharStringPen import T2CharStringPen
+        
+        print("OpenType/CFFフォントの角丸処理を開始します（T2CharString座標変化対応版）...")
+        
+        try:
+            cff_table = font['CFF ']
+            cff = cff_table.cff
+            topDict = cff.topDictIndex[0]
+            charStrings = topDict.CharStrings
+        except Exception as cff_error:
+            print(f"エラー: CFFテーブルの読み込みに失敗しました: {cff_error}")
+            return font
+        
+        processed_count = 0
+        
+        # T2CharString座標変化を考慮した最適化設定
+        if quality_level == 'high':
+            effective_angle_threshold = 160  # より多くの角を処理
+            effective_radius = radius * 0.8  # より積極的な半径
+            min_corner_radius = 1.0
+        elif quality_level == 'low':
+            effective_angle_threshold = 120  # 中程度の角まで処理
+            effective_radius = radius * 0.5  # 控えめな半径
+            min_corner_radius = 2.0
+        else:  # medium
+            effective_angle_threshold = 150  # 多くの角を処理
+            effective_radius = radius * 0.6  # バランスの取れた半径
+            min_corner_radius = 1.0
+        
+        for glyph_name in charStrings.keys():
+            try:
+                # CFFグリフからパスデータを取得
+                charString = charStrings[glyph_name]
+                
+                # RecordingPenを使ってパスデータを記録
+                pen = RecordingPen()
+                charString.draw(pen)
+                
+                # パスデータから輪郭を抽出
+                contours = self._extract_contours_from_recording_pen(pen.value)
+                
+                if not contours:
+                    continue
+                
+                # パス自動連結前処理
+                contours = self._auto_join_contours(contours)
+                
+                # オリジナル頂点数（全contour合計）
+                original_point_count = sum(len(c['coords']) for c in contours)
+
+                # T2CharString対応の角丸処理を各輪郭に適用
+                rounded_contours = []
+                corners_processed = 0
+                
+                for contour in contours:
+                    if len(contour['coords']) >= 3:
+                        # T2CharString対応の角丸処理を使用
+                        rounded_contour, corner_count = self._round_corners_t2charstring_compatible(
+                            contour, effective_radius, effective_angle_threshold, min_corner_radius
+                        )
+                        rounded_contours.append(rounded_contour)
+                        corners_processed += corner_count
+                    else:
+                        rounded_contours.append(contour)
+
+                # 角丸処理が実際に行われた場合のみ更新
+                if corners_processed > 0:
+                    # 新しい頂点数（全contour合計）
+                    new_point_count = sum(len(c['coords']) for c in rounded_contours)
+                    
+                    # 品質チェックを緩和（T2CharStringの座標変化を考慮）
+                    if original_point_count > 0:
+                        reduction_ratio = new_point_count / original_point_count
+                        # より緩い品質チェック（30%減少まで許容）
+                        if reduction_ratio < 0.3:
+                            print(f"[品質警告] グリフ '{glyph_name}': 頂点数が{int((1-reduction_ratio)*100)}%減少（{original_point_count}→{new_point_count}）。処理をスキップします。")
+                            continue
+
+                    # 新しいCharStringを作成
+                    try:
+                        # 元のCharStringの幅を取得
+                        original_width = getattr(charString, 'width', 0)
+                        
+                        # 元のPrivateDictを取得（安全にアクセス）
+                        original_private = None
+                        if hasattr(charString, 'private') and charString.private is not None:
+                            original_private = charString.private
+                        
+                        t2_pen = T2CharStringPen(width=original_width, glyphSet=None)
+                        
+                        for contour in rounded_contours:
+                            coords = contour['coords']
+                            flags = contour['flags']
+                            
+                            if not coords:
+                                continue
+                            
+                            # パスを描画
+                            t2_pen.moveTo(coords[0])
+                            
+                            i = 1
+                            while i < len(coords):
+                                if i >= len(flags):
+                                    break
+                                
+                                if flags[i] & 1:  # オンカーブ点
+                                    t2_pen.lineTo(coords[i])
+                                else:  # オフカーブ点（制御点）
+                                    if i + 1 < len(coords) and i + 1 < len(flags) and (flags[i + 1] & 1):
+                                        # 二次ベジェ曲線
+                                        t2_pen.qCurveTo(coords[i], coords[i + 1])
+                                        i += 1
+                                    else:
+                                        # 単独の制御点処理を改善
+                                        t2_pen.lineTo(coords[i])
+                                i += 1
+                            
+                            t2_pen.closePath()
+                        
+                        # 新しいCharStringで置き換え
+                        new_charstring = t2_pen.getCharString()
+                        
+                        # 属性を適切に設定
+                        new_charstring.width = original_width
+                        
+                        # PrivateDictを安全に設定
+                        if original_private is not None:
+                            try:
+                                new_charstring.private = original_private
+                            except Exception as private_error:
+                                print(f"    警告: PrivateDict設定エラー: {private_error}")
+                                self._set_default_private_dict(new_charstring, original_private)
+                        else:
+                            self._set_default_private_dict(new_charstring, None)
+                        
+                        charStrings[glyph_name] = new_charstring
+                        processed_count += 1
+                        print(f"  グリフ '{glyph_name}' の処理完了 ({corners_processed}角を角丸化)")
+                        
+                    except Exception as char_error:
+                        print(f"    CharString作成エラー: {char_error}")
+                        continue
+                
+            except Exception as e:
+                print(f"  エラー: グリフ '{glyph_name}' の処理中に例外が発生: {str(e)}")
+        
+        print(f"OpenType/CFFフォントの角丸処理が完了しました。処理されたグリフ数: {processed_count}個")
+        
+        return font
+
+    def _round_corners_cff_precision(self, contour, config_radius, angle_threshold=160):
+        """
+        CFF専用の高精度座標角丸処理
+        座標精度を制御し、整数座標との混在を避ける
+        """
+        import math
+        
+        coords = contour['coords']
+        flags = contour['flags']
+        n = len(coords)
+        
+        if config_radius == 0 or n < 3:
+            return contour
+        
+        # CFF座標の精度レベルを分析
+        precision_level = self._analyze_cff_coordinate_precision(coords)
+        print(f"    CFF座標精度レベル: {precision_level}")
+        
+        new_coords = []
+        new_flags = []
+        
+        for i in range(n):
+            p0 = coords[i - 1]
+            p1 = coords[i]
+            p2 = coords[(i + 1) % n]
+            
+            # ベクトル計算
+            v1 = (p0[0] - p1[0], p0[1] - p1[1])
+            v2 = (p2[0] - p1[0], p2[1] - p1[1])
+            norm1 = math.hypot(*v1)
+            norm2 = math.hypot(*v2)
+            
+            if norm1 == 0 or norm2 == 0:
+                new_coords.append(p1)
+                new_flags.append(flags[i])
+                continue
+            
+            # 角度計算
+            dot = v1[0] * v2[0] + v1[1] * v2[1]
+            cos_angle = dot / (norm1 * norm2)
+            cos_angle = max(-1.0, min(1.0, cos_angle))
+            angle_deg = math.degrees(math.acos(cos_angle))
+            
+            # 直線判定（CFF用の厳密な閾値）
+            if angle_deg >= 178.0:  # CFF用の直線閾値
+                new_coords.append(p1)
+                new_flags.append(flags[i])
+                continue
+            
+            # 角丸判定
+            if angle_deg < angle_threshold:
+                # 動的半径計算
+                max_radius = min(norm1, norm2) / 2.0
+                actual_radius = min(config_radius, max_radius)
+                
+                # 高精度座標計算（精度制御付き）
+                l1 = min(actual_radius, norm1 * 0.5)
+                l2 = min(actual_radius, norm2 * 0.5)
+                
+                # 座標計算（精度制御）
+                T1 = self._calculate_precise_coordinate(p1, p0, l1 / norm1, precision_level)
+                T2 = self._calculate_precise_coordinate(p1, p2, l2 / norm2, precision_level)
+                
+                # 3点を追加: T1 (オンカーブ), P1 (制御点), T2 (オンカーブ)
+                new_coords.append(T1)
+                new_flags.append(1)  # オンカーブ
+                new_coords.append(p1)
+                new_flags.append(0)  # オフカーブ（制御点）
+                new_coords.append(T2)
+                new_flags.append(1)  # オンカーブ
+            else:
+                # 通常の点をそのまま保持
+                new_coords.append(p1)
+                new_flags.append(flags[i])
+        
+        return {"coords": new_coords, "flags": new_flags}
+    
+    def _round_corners_t2charstring_compatible(self, contour, radius, angle_threshold, min_radius):
+        """
+        T2CharString互換の角丸処理
+        座標変化を前提とした最適化実装
+        """
+        import math
+        
+        coords = contour['coords']
+        flags = contour['flags']
+        n = len(coords)
+        
+        if radius == 0 or n < 3:
+            return contour, 0
+        
+        new_coords = []
+        new_flags = []
+        corners_rounded = 0
+        
+        for i in range(n):
+            p0 = coords[i - 1]
+            p1 = coords[i]
+            p2 = coords[(i + 1) % n]
+            
+            # ベクトル計算
+            v1 = (p0[0] - p1[0], p0[1] - p1[1])
+            v2 = (p2[0] - p1[0], p2[1] - p1[1])
+            norm1 = math.hypot(*v1)
+            norm2 = math.hypot(*v2)
+            
+            if norm1 == 0 or norm2 == 0:
+                new_coords.append(p1)
+                new_flags.append(flags[i])
+                continue
+            
+            # 角度計算
+            dot = v1[0] * v2[0] + v1[1] * v2[1]
+            cos_angle = dot / (norm1 * norm2)
+            cos_angle = max(-1.0, min(1.0, cos_angle))
+            angle_deg = math.degrees(math.acos(cos_angle))
+            
+            # 角丸判定（より緩い条件）
+            if angle_deg < angle_threshold and angle_deg > 3:
+                # 動的半径計算
+                max_radius = min(norm1, norm2) / 3.0
+                actual_radius = min(radius, max_radius)
+                
+                if actual_radius >= min_radius:
+                    # T2CharString対応の角丸処理
+                    corner_result = self._create_t2charstring_compatible_corner(
+                        p0, p1, p2, actual_radius, norm1, norm2, angle_deg
+                    )
+                    
+                    if corner_result:
+                        new_coords.extend(corner_result['coords'])
+                        new_flags.extend(corner_result['flags'])
+                        corners_rounded += 1
+                    else:
+                        new_coords.append(p1)
+                        new_flags.append(flags[i])
+                else:
+                    new_coords.append(p1)
+                    new_flags.append(flags[i])
+            else:
+                new_coords.append(p1)
+                new_flags.append(flags[i])
+        
+        return {"coords": new_coords, "flags": new_flags}, corners_rounded
+    
+    def _create_t2charstring_compatible_corner(self, p0, p1, p2, radius, norm1, norm2, angle_deg):
+        """T2CharString互換の角丸コーナーを作成"""
+        import math
+        
+        v1 = (p0[0] - p1[0], p0[1] - p1[1])
+        v2 = (p2[0] - p1[0], p2[1] - p1[1])
+        
+        # 角度に応じて処理方法を選択（範囲を拡大）
+        if angle_deg < 30:
+            # 非常に鋭角 - 単純な面取り（直線）
+            l1 = min(radius * 0.2, norm1 * 0.1)
+            l2 = min(radius * 0.2, norm2 * 0.1)
+            
+            T1 = (p1[0] + v1[0] * l1 / norm1, p1[1] + v1[1] * l1 / norm1)
+            T2 = (p1[0] + v2[0] * l2 / norm2, p1[1] + v2[1] * l2 / norm2)
+            
+            return {
+                'coords': [T1, T2],
+                'flags': [1, 1]  # 直線接続
+            }
+        
+        elif angle_deg < 90:
+            # 鋭角から中程度 - 控えめなベジェ曲線
+            l1 = min(radius * 0.3, norm1 * 0.15)
+            l2 = min(radius * 0.3, norm2 * 0.15)
+            
+            T1 = (p1[0] + v1[0] * l1 / norm1, p1[1] + v1[1] * l1 / norm1)
+            T2 = (p1[0] + v2[0] * l2 / norm2, p1[1] + v2[1] * l2 / norm2)
+            
+            # 制御点を保守的に設定（T2CharStringの座標変化を考慮）
+            ctrl_factor = 0.3
+            ctrl_x = p1[0] + (T1[0] - p1[0] + T2[0] - p1[0]) * ctrl_factor * 0.5
+            ctrl_y = p1[1] + (T1[1] - p1[1] + T2[1] - p1[1]) * ctrl_factor * 0.5
+            
+            return {
+                'coords': [T1, (ctrl_x, ctrl_y), T2],
+                'flags': [1, 0, 1]  # ベジェ曲線
+            }
+        
+        elif angle_deg < 150:
+            # 中程度から鈍角 - 標準的なベジェ曲線
+            l1 = min(radius * 0.4, norm1 * 0.2)
+            l2 = min(radius * 0.4, norm2 * 0.2)
+            
+            T1 = (p1[0] + v1[0] * l1 / norm1, p1[1] + v1[1] * l1 / norm1)
+            T2 = (p1[0] + v2[0] * l2 / norm2, p1[1] + v2[1] * l2 / norm2)
+            
+            # より滑らかな制御点
+            ctrl_factor = 0.4
+            ctrl_x = p1[0] + (T1[0] - p1[0] + T2[0] - p1[0]) * ctrl_factor * 0.5
+            ctrl_y = p1[1] + (T1[1] - p1[1] + T2[1] - p1[1]) * ctrl_factor * 0.5
+            
+            return {
+                'coords': [T1, (ctrl_x, ctrl_y), T2],
+                'flags': [1, 0, 1]  # ベジェ曲線
+            }
+        
+        elif angle_deg < 170:
+            # 鈍角 - 軽微な角丸
+            l1 = min(radius * 0.2, norm1 * 0.1)
+            l2 = min(radius * 0.2, norm2 * 0.1)
+            
+            T1 = (p1[0] + v1[0] * l1 / norm1, p1[1] + v1[1] * l1 / norm1)
+            T2 = (p1[0] + v2[0] * l2 / norm2, p1[1] + v2[1] * l2 / norm2)
+            
+            # 軽微な制御点
+            ctrl_factor = 0.2
+            ctrl_x = p1[0] + (T1[0] - p1[0] + T2[0] - p1[0]) * ctrl_factor * 0.5
+            ctrl_y = p1[1] + (T1[1] - p1[1] + T2[1] - p1[1]) * ctrl_factor * 0.5
+            
+            return {
+                'coords': [T1, (ctrl_x, ctrl_y), T2],
+                'flags': [1, 0, 1]  # ベジェ曲線
+            }
+        
+        else:
+            # 非常に鈍角（170度以上） - 処理しない
+            return None
+    
+    def _analyze_cff_coordinate_precision(self, coords):
+        """CFF座標の精度レベルを分析"""
+        if not coords:
+            return 0
+        
+        max_precision = 0
+        float_count = 0
+        
+        for coord in coords:
+            x, y = coord
+            
+            # X座標の精度
+            if x != int(x):
+                float_count += 1
+                x_str = str(x)
+                if '.' in x_str:
+                    x_precision = len(x_str.split('.')[-1])
+                    max_precision = max(max_precision, x_precision)
+            
+            # Y座標の精度
+            if y != int(y):
+                float_count += 1
+                y_str = str(y)
+                if '.' in y_str:
+                    y_precision = len(y_str.split('.')[-1])
+                    max_precision = max(max_precision, y_precision)
+        
+        # 精度レベルを決定
+        if float_count == 0:
+            return 0  # 全て整数座標
+        elif max_precision <= 3:
+            return 1  # 低精度浮動小数点
+        elif max_precision <= 6:
+            return 2  # 中精度浮動小数点
+        else:
+            return 3  # 高精度浮動小数点
+    
+    def _calculate_precise_coordinate(self, base_point, target_point, ratio, precision_level):
+        """精度制御付きの座標計算"""
+        import math
+        
+        # 基本計算
+        x = base_point[0] + (target_point[0] - base_point[0]) * ratio
+        y = base_point[1] + (target_point[1] - base_point[1]) * ratio
+        
+        # 精度レベルに応じて座標を調整
+        if precision_level == 0:
+            # 整数座標を維持
+            x = round(x)
+            y = round(y)
+        elif precision_level == 1:
+            # 低精度（小数点以下2桁）
+            x = round(x, 2)
+            y = round(y, 2)
+        elif precision_level == 2:
+            # 中精度（小数点以下4桁）
+            x = round(x, 4)
+            y = round(y, 4)
+        else:
+            # 高精度の場合でも6桁に制限
+            x = round(x, 6)
+            y = round(y, 6)
+        
+        return (x, y)
+
+    def _extract_contours_from_recording_pen(self, pen_value):
+        """RecordingPenの記録からcontourデータを抽出"""
+        contours = []
+        current_coords = []
+        current_flags = []
+        
+        for cmd, pts in pen_value:
+            if cmd == "moveTo":
+                if current_coords:
+                    contours.append({'coords': current_coords, 'flags': current_flags})
+                current_coords = [pts[0]]
+                current_flags = [1]  # オンカーブ
+            elif cmd == "lineTo":
+                current_coords.append(pts[0])
+                current_flags.append(1)  # オンカーブ
+            elif cmd == "qCurveTo":
+                # 制御点を追加
+                for p in pts[:-1]:
+                    current_coords.append(p)
+                    current_flags.append(0)  # オフカーブ
+                # 終点を追加
+                current_coords.append(pts[-1])
+                current_flags.append(1)  # オンカーブ
+            elif cmd == "curveTo":
+                # 三次ベジェ曲線を二次ベジェ曲線に近似
+                # 簡単な実装として制御点を追加
+                for p in pts[:-1]:
+                    current_coords.append(p)
+                    current_flags.append(0)  # オフカーブ
+                current_coords.append(pts[-1])
+                current_flags.append(1)  # オンカーブ
+            elif cmd == "closePath":
+                pass
+            elif cmd == "endPath":
+                pass
+        
+        if current_coords:
+            contours.append({'coords': current_coords, 'flags': current_flags})
+        
+        return contours
 
 
     def _extract_contours_from_coordinates(self, coordinates, endPts, flags):
@@ -642,3 +1173,57 @@ class RoundCornersEffect(BaseEffect):
         
         # 最小値と最大値を制限
         return max(0.1, min(5.0, threshold))
+
+    def _set_default_private_dict(self, charstring, original_private):
+        """
+        CharStringに安全なデフォルトPrivateDictを設定する
+        """
+        try:
+            from fontTools.cffLib import PrivateDict
+            
+            # 新しいPrivateDictを作成
+            private_dict = PrivateDict()
+            
+            if original_private is not None:
+                # 元のPrivateDictから値をコピー
+                try:
+                    if hasattr(original_private, 'nominalWidthX'):
+                        private_dict.nominalWidthX = original_private.nominalWidthX
+                    else:
+                        private_dict.nominalWidthX = 0
+                        
+                    if hasattr(original_private, 'defaultWidthX'):
+                        private_dict.defaultWidthX = original_private.defaultWidthX
+                    else:
+                        private_dict.defaultWidthX = 1000
+                        
+                    # その他の重要な属性もコピー
+                    for attr in ['Subrs', 'BlueValues', 'OtherBlues', 'FamilyBlues', 'FamilyOtherBlues']:
+                        if hasattr(original_private, attr):
+                            setattr(private_dict, attr, getattr(original_private, attr))
+                            
+                except Exception as copy_error:
+                    print(f"    警告: PrivateDict属性コピーエラー: {copy_error}")
+                    # コピーに失敗した場合はデフォルト値を設定
+                    private_dict.nominalWidthX = 0
+                    private_dict.defaultWidthX = 1000
+            else:
+                # デフォルト値を設定
+                private_dict.nominalWidthX = 0
+                private_dict.defaultWidthX = 1000
+            
+            # CharStringにPrivateDictを設定
+            charstring.private = private_dict
+            
+        except Exception as e:
+            print(f"    警告: デフォルトPrivateDict作成エラー: {e}")
+            # 最後の手段として、空のオブジェクトを作成
+            try:
+                class SafePrivateDict:
+                    def __init__(self):
+                        self.nominalWidthX = 0
+                        self.defaultWidthX = 1000
+                
+                charstring.private = SafePrivateDict()
+            except Exception as fallback_error:
+                print(f"    エラー: フォールバックPrivateDict作成失敗: {fallback_error}")
