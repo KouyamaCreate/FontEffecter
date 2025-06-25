@@ -328,15 +328,16 @@ class RoundCornersEffect(BaseEffect):
                 # オリジナル頂点数（全contour合計）
                 original_point_count = sum(len(c['coords']) for c in contours)
 
-                # T2CharString対応の角丸処理を各輪郭に適用
+                # 改良された角丸処理を各輪郭に適用（ベジェ曲線対応）
                 rounded_contours = []
                 corners_processed = 0
                 
                 for contour in contours:
                     if len(contour['coords']) >= 3:
-                        # T2CharString対応の角丸処理を使用
-                        rounded_contour, corner_count = self._round_corners_t2charstring_compatible(
-                            contour, effective_radius, effective_angle_threshold, min_corner_radius
+                        # 改良された角丸処理を使用（角度閾値を179度まで拡張）
+                        print(f"    輪郭処理開始: {len(contour['coords'])}点")
+                        rounded_contour, corner_count = self._round_corners_improved_for_curves(
+                            contour, effective_radius, 179.0  # 滑らかな曲線も処理
                         )
                         rounded_contours.append(rounded_contour)
                         corners_processed += corner_count
@@ -1227,3 +1228,108 @@ class RoundCornersEffect(BaseEffect):
                 charstring.private = SafePrivateDict()
             except Exception as fallback_error:
                 print(f"    エラー: フォールバックPrivateDict作成失敗: {fallback_error}")
+
+    def _round_corners_improved_for_curves(self, contour, radius, angle_threshold=179.0):
+        """
+        曲線グリフ用の改良された角丸処理
+        ベジェ曲線の制御点を考慮し、179度まで処理対象を拡張
+        """
+        import math
+        
+        coords = contour['coords']
+        flags = contour['flags']
+        n = len(coords)
+        
+        if radius == 0 or n < 3:
+            return contour, 0
+        
+        print(f"    改良角丸処理: {n}点, 制御点{sum(1 for f in flags if not (f & 1))}個")
+        
+        new_coords = []
+        new_flags = []
+        corners_rounded = 0
+        
+        for i in range(n):
+            p0 = coords[i - 1]
+            p1 = coords[i]
+            p2 = coords[(i + 1) % n]
+            
+            # 現在の点が制御点かどうかをチェック
+            is_control_point = not (flags[i] & 1)
+            
+            if is_control_point:
+                # 制御点はそのまま保持（ベジェ曲線の形状を維持）
+                new_coords.append(p1)
+                new_flags.append(flags[i])
+                continue
+            
+            # オンカーブ点での角度計算
+            v1 = (p0[0] - p1[0], p0[1] - p1[1])
+            v2 = (p2[0] - p1[0], p2[1] - p1[1])
+            norm1 = math.hypot(*v1)
+            norm2 = math.hypot(*v2)
+            
+            if norm1 == 0 or norm2 == 0:
+                new_coords.append(p1)
+                new_flags.append(flags[i])
+                continue
+            
+            # 角度計算
+            dot = v1[0] * v2[0] + v1[1] * v2[1]
+            cos_angle = dot / (norm1 * norm2)
+            cos_angle = max(-1.0, min(1.0, cos_angle))
+            angle_deg = math.degrees(math.acos(cos_angle))
+            
+            print(f"      点{i}: 角度{angle_deg:.1f}度")
+            
+            # 拡張された角度閾値で判定（179度まで処理）
+            if angle_deg < angle_threshold:
+                # 角度に応じた動的半径調整
+                if angle_deg > 175:
+                    # 非常に滑らかな角度 - 軽微な角丸
+                    radius_factor = 0.1
+                    ctrl_factor = 0.2
+                elif angle_deg > 170:
+                    # 滑らかな角度 - 控えめな角丸
+                    radius_factor = 0.2
+                    ctrl_factor = 0.3
+                elif angle_deg > 150:
+                    # 中程度の角度 - 標準的な角丸
+                    radius_factor = 0.3
+                    ctrl_factor = 0.4
+                else:
+                    # 鋭角 - 強めの角丸
+                    radius_factor = 0.4
+                    ctrl_factor = 0.5
+                
+                # 動的半径計算
+                max_radius = min(norm1, norm2) / 3.0
+                actual_radius = min(radius * radius_factor, max_radius)
+                
+                if actual_radius > 0.5:  # 最小半径チェック
+                    l1 = min(actual_radius, norm1 * 0.3)
+                    l2 = min(actual_radius, norm2 * 0.3)
+                    
+                    T1 = (p1[0] + v1[0] * l1 / norm1, p1[1] + v1[1] * l1 / norm1)
+                    T2 = (p1[0] + v2[0] * l2 / norm2, p1[1] + v2[1] * l2 / norm2)
+                    
+                    # 滑らかな制御点を生成
+                    ctrl_x = p1[0] + (T1[0] - p1[0] + T2[0] - p1[0]) * ctrl_factor * 0.5
+                    ctrl_y = p1[1] + (T1[1] - p1[1] + T2[1] - p1[1]) * ctrl_factor * 0.5
+                    
+                    new_coords.extend([T1, (ctrl_x, ctrl_y), T2])
+                    new_flags.extend([1, 0, 1])  # オンカーブ, オフカーブ, オンカーブ
+                    corners_rounded += 1
+                    
+                    print(f"        角丸適用: 半径{actual_radius:.1f}, 制御点係数{ctrl_factor}")
+                else:
+                    # 半径が小さすぎる場合は元の点を保持
+                    new_coords.append(p1)
+                    new_flags.append(flags[i])
+            else:
+                # 角度が閾値以上の場合は元の点を保持
+                new_coords.append(p1)
+                new_flags.append(flags[i])
+        
+        print(f"    角丸処理完了: {corners_rounded}角を処理")
+        return {"coords": new_coords, "flags": new_flags}, corners_rounded
